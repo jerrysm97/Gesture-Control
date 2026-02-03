@@ -4,7 +4,8 @@ from PIL import Image, ImageTk
 import cv2
 import threading
 import time
-import queue
+from collections import deque
+import numpy as np
 
 from tracker import HandTracker
 from gestures import GestureClassifier
@@ -13,8 +14,8 @@ from controller import MacController
 class GestureApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Hand Gesture Control Center")
-        self.root.geometry("1000x700")
+        self.root.title("Hand Gesture Control Center v2.1")
+        self.root.geometry("1100x750")
         
         # Backend
         self.tracker = HandTracker()
@@ -27,11 +28,40 @@ class GestureApp:
         self.frame_count = 0
         self.start_time = time.time()
         
-        # State
-        self.current_gesture = "None"
-        self.active_mode = "INACTIVE" # INACTIVE, ACTIVE, CALIBRATION
+        # State Management
+        self.is_paused = True # Start Paused
+        self.prev_gesture = "None"
         
-        # Main Layout
+        # Cursor Smoothing (EMA)
+        self.smooth_x = 0.5
+        self.smooth_y = 0.5
+        self.smoothing_factor = 0.5 
+        
+        # Calibration (Active Region)
+        # Default box (Center 60%)
+        self.calib_bounds = {"x_min": 0.2, "x_max": 0.8, "y_min": 0.2, "y_max": 0.8}
+        self.calibration_active = False
+        self.calib_start_time = 0
+        self.calib_duration = 5.0 # Seconds to measure bounds
+        self.calib_temp_min_x = 1.0
+        self.calib_temp_max_x = 0.0
+        self.calib_temp_min_y = 1.0
+        self.calib_temp_max_y = 0.0
+        
+        self.show_calib_box = tk.BooleanVar(value=True)
+        
+        # Pinch / Click Logic
+        self.is_pinching = False
+        self.pinch_start_time = 0
+        self.is_dragging = False
+        self.last_click_time = 0
+        
+        # Swipe Logic
+        self.swipe_history = deque(maxlen=10)
+        self.last_swipe_time = 0
+        self.swipe_cooldown = 1.0
+        
+        # UI Setup
         self.main_container = ttk.Frame(root)
         self.main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
@@ -50,7 +80,7 @@ class GestureApp:
         self.control_panel = ttk.Frame(self.main_container, width=300)
         self.control_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=10)
         
-        # Status Box
+        # Status
         self.status_frame = ttk.LabelFrame(self.control_panel, text="System Status")
         self.status_frame.pack(fill=tk.X, pady=5)
         
@@ -60,23 +90,52 @@ class GestureApp:
         self.lbl_gesture = ttk.Label(self.status_frame, text="Gesture: None", font=("Arial", 14, "bold"))
         self.lbl_gesture.pack(ipady=5)
         
-        self.lbl_mode = ttk.Label(self.status_frame, text="Mode: INACTIVE", foreground="red")
-        self.lbl_mode.pack(ipady=5)
+        self.lbl_state = ttk.Label(self.status_frame, text="PAUSED", foreground="red", font=("Arial", 16))
+        self.lbl_state.pack(ipady=5)
 
-        # Controls
-        self.btn_toggle = ttk.Button(self.control_panel, text="Start Tracking", command=self.toggle_tracking)
-        self.btn_toggle.pack(fill=tk.X, pady=10)
+        # Calibration
+        self.calib_frame = ttk.LabelFrame(self.control_panel, text="Calibration")
+        self.calib_frame.pack(fill=tk.X, pady=10)
         
-        self.btn_calib = ttk.Button(self.control_panel, text="Calibrate", command=self.start_calibration)
-        self.btn_calib.pack(fill=tk.X, pady=5)
-        
+        ttk.Button(self.calib_frame, text="Start Calibration", command=self.start_calibration).pack(fill=tk.X, padx=5, pady=5)
+        ttk.Checkbutton(self.calib_frame, text="Show Box", variable=self.show_calib_box).pack(anchor=tk.W, padx=5)
+
         # Settings
-        self.settings_frame = ttk.LabelFrame(self.control_panel, text="Sensitivity")
+        self.settings_frame = ttk.LabelFrame(self.control_panel, text="Configuration")
         self.settings_frame.pack(fill=tk.X, pady=10)
         
-        ttk.Label(self.settings_frame, text="Smoothing:").pack(anchor=tk.W)
-        self.scale_smooth = ttk.Scale(self.settings_frame, from_=0.1, to=1.0, value=0.5)
+        ttk.Label(self.settings_frame, text="Smoothing (EMA):").pack(anchor=tk.W, pady=(5,0))
+        self.scale_smooth = ttk.Scale(self.settings_frame, from_=0.1, to=0.9, value=0.5, command=self._update_smooth)
         self.scale_smooth.pack(fill=tk.X)
+        self.lbl_smooth_val = ttk.Label(self.settings_frame, text="0.5")
+        self.lbl_smooth_val.pack(anchor=tk.E)
+        
+        # Instructions
+        self.help_frame = ttk.LabelFrame(self.control_panel, text="Valid Gestures")
+        self.help_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        help_text = (
+            "• Fist: PAUSE\n"
+            "• Open Palm: ACTIVATE\n"
+            "• Pinch: Click / Drag\n"
+            "• Thumbs Up: Vol Up\n"
+            "• Thumbs Down: Vol Down\n"
+            "• Swipe: Switch App/Desk"
+        )
+        ttk.Label(self.help_frame, text=help_text, justify=tk.LEFT).pack(padx=5, pady=5)
+
+    def _update_smooth(self, val):
+        self.smoothing_factor = float(val)
+        self.lbl_smooth_val.configure(text=f"{self.smoothing_factor:.2f}")
+
+    def start_calibration(self):
+        self.calibration_active = True
+        self.calib_start_time = time.time()
+        # Reset temp bounds
+        self.calib_temp_min_x = 1.0
+        self.calib_temp_max_x = 0.0
+        self.calib_temp_min_y = 1.0
+        self.calib_temp_max_y = 0.0
 
     def _start_threads(self):
         self.cap = cv2.VideoCapture(0)
@@ -89,40 +148,52 @@ class GestureApp:
             ret, frame = self.cap.read()
             if not ret: continue
             
-            # 1. Flip & Color
             frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
             
-            # 2. Tracking
             self.tracker.process_frame(frame)
             result = self.tracker.get_latest_landmarks()
             
-            # 3. Logic
             gesture_name = "None"
+            
             if result and result.hand_landmarks:
                 landmarks = result.hand_landmarks[0]
                 gesture_name = self.classifier.classify(landmarks)
                 
-                # Draw Landmarks (Simple Lines)
+                # Check Calibration
+                if self.calibration_active:
+                    self._process_calibration(landmarks)
+                else:
+                    # Update State
+                    if gesture_name == "Fist":
+                        self.is_paused = True
+                    elif gesture_name == "Open_Palm" and self.is_paused:
+                        self.is_paused = False
+                    elif gesture_name == "Thumbs_Up":
+                        self.controller.volume_up() 
+                    elif gesture_name == "Thumbs_Down":
+                        self.controller.volume_down()
+                        
+                    # Core Logic
+                    if not self.is_paused:
+                        if gesture_name == "Three_Fingers":
+                            self._handle_swipe_gesture(landmarks)
+                        else:
+                            self._handle_active_mode(gesture_name, landmarks)
+                        
                 self._draw_landmarks(frame, landmarks)
                 
-                # Execute Logic (If Active)
-                if self.active_mode == "ACTIVE":
-                    self._handle_gesture_action(gesture_name, landmarks)
-
             self.current_gesture = gesture_name
             
-            # 4. Display
-            # Draw Status Overlay
-            cv2.putText(frame, f"Mode: {self.active_mode}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, f"Gesture: {gesture_name}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            # Overlay
+            self._draw_overlay(frame, gesture_name)
             
-            # Convert for Tkinter
+            # Tkinter Convert
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(rgb)
-            img = img.resize((640, 480)) # Resize for GUI
+            img = img.resize((720, 540))
             self.current_image = ImageTk.PhotoImage(image=img)
             
-            # FPS Calculation
             self.frame_count += 1
             if time.time() - self.start_time > 1.0:
                 self.fps = self.frame_count / (time.time() - self.start_time)
@@ -131,35 +202,145 @@ class GestureApp:
                 
             time.sleep(0.01)
 
-    def _handle_gesture_action(self, gesture, landmarks):
-        """Map Gestures to Controller Actions"""
-        # Mouse Move (Open Palm)
-        if gesture == "Open_Palm":
-            # Index Finger Base (5) or Palm Center (0, 9, 17 avg) as anchor
-            # Let's use Index MCP (5) for stability
-            point = landmarks[5]
-            # Simple direct mapping (Needs calibration logic, using raw 0-1 for now)
-            # Apply basic margin to allow reaching corners
-            x = (point.x - 0.2) / 0.6
-            y = (point.y - 0.2) / 0.6
-            self.controller.move_mouse(x, y)
+    def _process_calibration(self, landmarks):
+        # Time remaining
+        elapsed = time.time() - self.calib_start_time
+        if elapsed > self.calib_duration:
+            # Finish
+            self.calibration_active = False
+            # Save bounds with a small margin padding? 
+            # Or just take exactly what user did. Let's take exactly.
+            self.calib_bounds["x_min"] = max(0.0, self.calib_temp_min_x)
+            self.calib_bounds["x_max"] = min(1.0, self.calib_temp_max_x)
+            self.calib_bounds["y_min"] = max(0.0, self.calib_temp_min_y)
+            self.calib_bounds["y_max"] = min(1.0, self.calib_temp_max_y)
+            print(f"New Bounds: {self.calib_bounds}")
+            return
             
-        elif gesture == "Pointing":
-             # Move + Click ? Or just Move?
-             # Let's say Pointing = Move & Hover. 
-             # Pinched Pointing usually better for drag.
-             pass
+        # Update temp bounds with Index Tip (8) or Wrist (0)
+        # Using Index Tip because that's what drives the cursor
+        point = landmarks[8]
+        self.calib_temp_min_x = min(self.calib_temp_min_x, point.x)
+        self.calib_temp_max_x = max(self.calib_temp_max_x, point.x)
+        self.calib_temp_min_y = min(self.calib_temp_min_y, point.y)
+        self.calib_temp_max_y = max(self.calib_temp_max_y, point.y)
 
-        elif gesture == "Fist":
-             # Scroll or Drag? Let's say Grab
-             # Not implemented in controller distinct drag yet without state
-             pass
-             
-        elif gesture == "Thumbs_Up":
-             self.controller.volume_up()
+    def _handle_swipe_gesture(self, landmarks):
+        # Update Swipe History (Wrist X)
+        wrist = landmarks[0]
+        self.swipe_history.append((wrist.x, time.time()))
+        self._check_swipe()
 
-        elif gesture == "Peace":
-             self.controller.click('right')
+    def _handle_active_mode(self, gesture, landmarks):
+        # 1. Cursor Measurement 
+        # SWITCHED to Index Tip (8) for precision
+        # When Pinching, use midpoint of 4/8 or just keep using 8?
+        # If we use 8, pinching moves the point. 
+        # Let's use Index MCP (5) still? 
+        # User requested "index finger and thum start to move" -> Precision.
+        # Let's use Index Tip (8).
+        pointer = landmarks[8] 
+        self._move_cursor(pointer.x, pointer.y)
+        
+        # 3. Pinch / Click Logic
+        if gesture == "Pinch":
+            if not self.is_pinching:
+                self.is_pinching = True
+                self.pinch_start_time = time.time()
+            else:
+                duration = time.time() - self.pinch_start_time
+                if duration > 0.2 and not self.is_dragging: # Reduced drag delay
+                    self.is_dragging = True
+                    self.controller.mouse_down()
+        else:
+            if self.is_pinching:
+                # Released Pinch
+                duration = time.time() - self.pinch_start_time
+                self.is_pinching = False
+                
+                if self.is_dragging:
+                    self.is_dragging = False
+                    self.controller.mouse_up()
+                else:
+                    if duration < 0.2:
+                        if time.time() - self.last_click_time < 0.4:
+                            self.controller.double_click()
+                        else:
+                            self.controller.click()
+                        self.last_click_time = time.time()
+
+    def _move_cursor(self, raw_x, raw_y):
+        # Map raw normalized coords (0-1) to screen using Dynamic Bounds
+        min_x = self.calib_bounds["x_min"]
+        max_x = self.calib_bounds["x_max"]
+        min_y = self.calib_bounds["y_min"]
+        max_y = self.calib_bounds["y_max"]
+        
+        # Normalize to 0-1 within the box
+        width = max_x - min_x
+        height = max_y - min_y
+        
+        if width == 0 or height == 0: return
+        
+        x_mapped = np.clip((raw_x - min_x) / width, 0.0, 1.0)
+        y_mapped = np.clip((raw_y - min_y) / height, 0.0, 1.0)
+        
+        # Smoothing (EMA)
+        alpha = self.smoothing_factor
+        self.smooth_x = alpha * x_mapped + (1 - alpha) * self.smooth_x
+        self.smooth_y = alpha * y_mapped + (1 - alpha) * self.smooth_y
+        
+        self.controller.move_mouse(self.smooth_x, self.smooth_y)
+
+    def _check_swipe(self):
+        if time.time() - self.last_swipe_time < self.swipe_cooldown: return
+        if len(self.swipe_history) < 5: return
+        
+        start_x, start_t = self.swipe_history[0]
+        end_x, end_t = self.swipe_history[-1]
+        
+        dt = end_t - start_t
+        if dt == 0: return
+        
+        velocity = (end_x - start_x) / dt 
+        
+        if velocity > 0.8: 
+            self.controller.swipe_right()
+            self.last_swipe_time = time.time()
+        elif velocity < -0.8: 
+            self.controller.swipe_left()
+            self.last_swipe_time = time.time()
+
+    def _draw_overlay(self, frame, gesture):
+        h, w, _ = frame.shape
+        
+        if self.calibration_active:
+            elapsed = time.time() - self.calib_start_time
+            remaining = int(self.calib_duration - elapsed)
+            
+            cv2.rectangle(frame, (0,0), (w,h), (0,0,0), -1)
+            cv2.putText(frame, "CALIBRATION MODE", (w//2-150, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+            cv2.putText(frame, f"Move hand to all corners! {remaining}s", (50, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            return
+
+        # Active Region
+        if self.show_calib_box.get() and not self.is_paused:
+            x1 = int(self.calib_bounds["x_min"] * w)
+            y1 = int(self.calib_bounds["y_min"] * h)
+            x2 = int(self.calib_bounds["x_max"] * w)
+            y2 = int(self.calib_bounds["y_max"] * h)
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            cv2.putText(frame, "Active Region", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+
+        # Status
+        color = (0, 0, 255) if self.is_paused else (0, 255, 0)
+        status = "PAUSED" if self.is_paused else "ACTIVE"
+        cv2.putText(frame, f"System: {status}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(frame, f"Gesture: {gesture}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
+        
+        if self.is_dragging:
+             cv2.putText(frame, "DRAGGING", (w-150, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
     def _draw_landmarks(self, frame, landmarks):
         h, w, _ = frame.shape
@@ -168,108 +349,18 @@ class GestureApp:
             cv2.circle(frame, (cx, cy), 4, (0, 255, 0), -1)
 
     def _update_gui(self):
-        """Main Thread UI Update"""
         if hasattr(self, 'current_image'):
             self.video_label.configure(image=self.current_image)
         
         self.lbl_fps.configure(text=f"FPS: {self.fps:.1f}")
-        self.lbl_gesture.configure(text=f"Last: {self.current_gesture}")
-        self.lbl_mode.configure(text=f"Mode: {self.active_mode}", foreground="green" if self.active_mode == "ACTIVE" else "red")
+        self.lbl_gesture.configure(text=f"Gesture: {self.current_gesture}")
         
+        if self.is_paused:
+            self.lbl_state.configure(text="PAUSED", foreground="red")
+        else:
+            self.lbl_state.configure(text="ACTIVE", foreground="green")
+            
         self.root.after(30, self._update_gui)
-
-    def toggle_tracking(self):
-        if self.active_mode == "INACTIVE":
-            self.active_mode = "ACTIVE"
-            self.btn_toggle.configure(text="Stop Tracking")
-        else:
-            self.active_mode = "INACTIVE"
-            self.btn_toggle.configure(text="Start Tracking")
-
-    def start_calibration(self):
-        self.active_mode = "CALIBRATION"
-        self.calib_step = 0
-        self.calib_bounds = {"x_min": 1.0, "x_max": 0.0, "y_min": 1.0, "y_max": 0.0}
-
-    def _draw_calibration(self, frame):
-        h, w, _ = frame.shape
-        cv2.rectangle(frame, (0,0), (w,h), (0,0,0), -1)
-        
-        steps = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
-        if self.calib_step < 4:
-            msg = f"Touch {steps[self.calib_step]} Corner"
-            cv2.putText(frame, msg, (50, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-            cv2.putText(frame, "Hold 'Fist' to Capture", (50, h//2 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 1)
-            
-            # Draw target dots
-            pts = [(50,50), (w-50,50), (w-50,h-50), (50,h-50)]
-            cv2.circle(frame, pts[self.calib_step], 20, (0,255,255), -1)
-        else:
-            cv2.putText(frame, "Calibration Done!", (w//2-100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-            
-    def _handle_calibration_input(self, gesture, landmarks):
-        if gesture == "Fist":
-            # Taking average of wrist or index MCP as cursor point
-            point = landmarks[5] # Index MCP
-            
-            # Store bounds (simplistic approach: just recording the limit)
-            # A real wizard would wait for a "hold" confirmation.
-            # We'll just advance step for this demo on first detection.
-            # Ideally debounce this.
-            
-            if not hasattr(self, 'last_calib_time'): self.last_calib_time = 0
-            if time.time() - self.last_calib_time < 1.0: return
-            
-            self.last_calib_time = time.time()
-            self.calib_step += 1
-            if self.calib_step >= 4:
-                self.active_mode = "INACTIVE"
-                print("Calibration Completed (Mock).")
-
-    def _process_loop(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret: continue
-            
-            frame = cv2.flip(frame, 1)
-            self.tracker.process_frame(frame)
-            result = self.tracker.get_latest_landmarks()
-            
-            gesture_name = "None"
-            landmarks = None
-            
-            if result and result.hand_landmarks:
-                landmarks = result.hand_landmarks[0]
-                gesture_name = self.classifier.classify(landmarks)
-                self._draw_landmarks(frame, landmarks)
-                
-                if self.active_mode == "ACTIVE":
-                    self._handle_gesture_action(gesture_name, landmarks)
-                elif self.active_mode == "CALIBRATION":
-                    self._handle_calibration_input(gesture_name, landmarks)
-
-            if self.active_mode == "CALIBRATION":
-                self._draw_calibration(frame)
-            else:
-                 # Standard Overlay
-                cv2.putText(frame, f"Mode: {self.active_mode}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, f"Gesture: {gesture_name}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-            self.current_gesture = gesture_name
-            
-            # Tkinter Convert
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb)
-            img = img.resize((640, 480))
-            self.current_image = ImageTk.PhotoImage(image=img)
-            
-            self.frame_count += 1
-            if time.time() - self.start_time > 1.0:
-                self.fps = self.frame_count / (time.time() - self.start_time)
-                self.frame_count = 0
-                self.start_time = time.time()
-                
-            time.sleep(0.01)
 
     def close(self):
         self.running = False

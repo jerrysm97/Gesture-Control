@@ -1,6 +1,7 @@
 import pyautogui
 import os
 import time
+import platform
 
 class MacController:
     def __init__(self):
@@ -71,10 +72,39 @@ class MacController:
         self._key_press(145)
 
     def switch_app(self):
-        """Cmd+Tab"""
+        """Switch triggers Alt+Tab (Win) or Cmd+Tab (Mac)"""
         if self._can_act():
-            pyautogui.hotkey('command', 'tab')
+            mod = 'command' if platform.system() == 'Darwin' else 'alt'
+            pyautogui.hotkey(mod, 'tab')
             self._record_action()
+
+    def swipe_left(self):
+        """Triggers Desktop Switch Left"""
+        if self._can_act():
+            if platform.system() == 'Darwin':
+                # Mac: Ctrl + Left Arrow
+                pyautogui.hotkey('ctrl', 'left')
+            else:
+                # Windows: Ctrl + Win + Left Arrow
+                pyautogui.hotkey('ctrl', 'win', 'left')
+            self._record_action()
+
+    def swipe_right(self):
+        """Triggers Desktop Switch Right"""
+        if self._can_act():
+            if platform.system() == 'Darwin':
+                # Mac: Ctrl + Right Arrow
+                pyautogui.hotkey('ctrl', 'right')
+            else:
+                # Windows: Ctrl + Win + Right Arrow
+                pyautogui.hotkey('ctrl', 'win', 'right')
+            self._record_action()
+
+    def mouse_down(self):
+        pyautogui.mouseDown(button='left')
+        
+    def mouse_up(self):
+        pyautogui.mouseUp(button='left')
 
     # --- Utils ---
     def _can_act(self):

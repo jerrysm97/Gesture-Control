@@ -23,11 +23,18 @@ class GestureClassifier:
         states = self._get_finger_states(landmarks)
         
         # 2. Rule-Based Classification
+        # Check Pinch first (Action overrides static pose)
+        if self._is_pinch(states, landmarks): return "Pinch"
+
         if self._is_fist(states): return "Fist"
         if self._is_open_palm(states): return "Open_Palm"
         if self._is_pointing(states): return "Pointing"
         if self._is_peace(states): return "Peace"
+        if self._is_three_fingers(states): return "Three_Fingers"
         if self._is_thumbs_up(states, landmarks): return "Thumbs_Up"
+        if self._is_thumbs_down(states, landmarks): return "Thumbs_Down"
+        
+        return "Unknown"
         
         return "Unknown"
 
@@ -74,8 +81,21 @@ class GestureClassifier:
     def _dist(self, p1, p2):
         return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
+    def calculate_distance(self, p1, p2):
+        """Public wrapper for distance calculation"""
+        return self._dist(p1, p2)
+
     # --- Rules ---
     
+    def _is_pinch(self, s, landmarks):
+        # Thumb Tip and Index Tip are very close
+        thumb_tip = landmarks[4]
+        index_tip = landmarks[8]
+        distance = self._dist(thumb_tip, index_tip)
+        
+        # Increased threshold for easier triggering
+        return distance < 0.08
+
     def _is_fist(self, s):
         # All 4 fingers curled. Thumb can be anything (often curled or tucked).
         return (not s["Index"] and not s["Middle"] and not s["Ring"] and not s["Pinky"])
@@ -101,3 +121,17 @@ class GestureClassifier:
         wrist = landmarks[0]
         thumb_tip = landmarks[4]
         return thumb_tip.y < wrist.y # Simple "Up" check (Y increases downwards in CV coords)
+
+    def _is_three_fingers(self, s):
+        # Index, Middle, Ring extended. Pinky curled.
+        return s["Index"] and s["Middle"] and s["Ring"] and not s["Pinky"]
+
+    def _is_thumbs_down(self, s, landmarks):
+        # Thumb extended, others curled.
+        # Plus orientation check: Thumb Tip Y > Wrist Y (Downwards)
+        if not (s["Thumb"] and not s["Index"] and not s["Middle"] and not s["Ring"] and not s["Pinky"]):
+            return False
+            
+        wrist = landmarks[0]
+        thumb_tip = landmarks[4]
+        return thumb_tip.y > wrist.y
